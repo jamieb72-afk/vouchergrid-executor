@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Predicate } from "effect";
+import { Effect, Exit, Fiber, Predicate } from "effect";
 
 import {
   AuthTemplateSlug,
@@ -950,6 +950,94 @@ describe("oauth token refresh in resolveConnectionValue", () => {
             request.path === "/token" && request.body.includes("grant_type=refresh_token"),
         );
         expect(refreshGrants).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.effect("a joined stack survives the owning stack being interrupted mid-refresh", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const harness = yield* makeTestWorkspaceHarness({ plugins });
+        const { executor, config } = harness;
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: server.mcpResourceUrl,
+        });
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        const address = ToolAddress.make("tools.acme.org.main.whoami");
+        yield* executor.execute(address, {});
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "main"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+
+        // Park the owning stack inside the token request so the second stack
+        // has a window to join the in-flight grant before the interrupt lands.
+        let release: (() => void) | null = null;
+        const parked = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let sawTokenRequest = false;
+        // oxlint-disable-next-line executor/no-raw-fetch -- test seam: this wrapper replaces the platform fetch and must delegate back to it once unparked
+        const passthrough: typeof globalThis.fetch = globalThis.fetch;
+        const parkingFetch: typeof globalThis.fetch = async (input, init) => {
+          if (String(input).includes("/token")) {
+            sawTokenRequest = true;
+            await parked;
+          }
+          return passthrough(input, init);
+        };
+
+        const owner = yield* createExecutor({ ...config, fetch: parkingFetch });
+        const joiner = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => owner.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => joiner.close().pipe(Effect.ignore));
+
+        const outcome = yield* Effect.promise(async () => {
+          const ownerFiber = Effect.runFork(owner.execute(address, {}));
+          for (let attempt = 0; attempt < 300 && !sawTokenRequest; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          const joined = Effect.runPromise(Effect.exit(joiner.execute(address, {})));
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          // The owning stack's MCP client disconnects mid-refresh. Its
+          // interruption only lands once the shared grant settles, so unpark the
+          // token request rather than awaiting the interrupt first.
+          const interrupted = Effect.runPromise(Fiber.interrupt(ownerFiber));
+          release?.();
+          await interrupted;
+          return await joined;
+        });
+
+        expect(sawTokenRequest).toBe(true);
+        expect(Exit.isSuccess(outcome), "the joined stack completed on the shared grant").toBe(
+          true,
+        );
       }),
     ),
   );

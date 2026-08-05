@@ -1,4 +1,4 @@
-import { Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
+import { Effect, Fiber, Inspectable, Layer, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
 import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
@@ -2119,17 +2119,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // grant rather than replaying the stale memoized one.
         const existing = refreshInFlight.get(key);
         if (existing) return yield* existing;
-        // `Effect.cached` memoizes the grant onto a deferred: it runs once and
-        // replays to every awaiter sharing this entry.
-        const memoized = yield* Effect.cached(performTokenRefresh(row, provider, trigger));
-        const gated = memoized.pipe(
-          Effect.ensuring(Effect.sync(() => refreshInFlight.delete(key))),
+        // The grant runs on its OWN fiber and callers only JOIN it. This entry is
+        // shared by every execution stack on this database, so the fiber that
+        // registers it is merely the first arrival, not an owner: if the grant
+        // inherited that caller's interruption (a disconnected MCP client, an
+        // execution deadline, a cancelled tool call) every peer awaiting the same
+        // entry would fail with an interrupt none of them caused and none can act
+        // on. Joining is per-caller, so a cancelled peer detaches without
+        // touching the grant or its siblings. A grant nobody is left waiting on
+        // still settles — token requests are bounded by `AbortSignal.timeout` —
+        // and still persists the rotated token, which is what keeps the next
+        // caller off a consumed one.
+        const running = Effect.runFork(
+          performTokenRefresh(row, provider, trigger).pipe(
+            Effect.ensuring(Effect.sync(() => refreshInFlight.delete(key))),
+          ),
         );
-        // Re-check after building (a peer fiber may have registered first while
-        // we built ours) so everyone converges on the same shared grant.
-        const winner = refreshInFlight.get(key) ?? gated;
-        if (winner === gated) refreshInFlight.set(key, gated);
-        return yield* winner;
+        // No `yield*` between the lookup above and this registration, so
+        // check-and-set is atomic against peer fibers and cannot double-fire.
+        const shared = Fiber.join(running);
+        refreshInFlight.set(key, shared);
+        return yield* shared;
       });
 
     // Resolve every named input of a connection (`variable → value`). A
