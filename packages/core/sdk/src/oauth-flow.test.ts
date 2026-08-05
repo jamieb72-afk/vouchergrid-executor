@@ -14,6 +14,7 @@ import { authToolFailure } from "./auth-tool-failure";
 import { decodeOAuthCallbackState } from "./oauth";
 import { OAuthStartError } from "./oauth-client";
 import { missingGrantedOAuthScopes } from "./oauth-service";
+import { createExecutor } from "./executor";
 import { definePlugin } from "./plugin";
 import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
 import { ToolResult } from "./tool-result";
@@ -880,6 +881,75 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         expect(refreshRequest?.body).toContain(
           `resource=${encodeURIComponent(server.mcpResourceUrl)}`,
         );
+      }),
+    ),
+  );
+
+  it.effect("shares one refresh grant across executor stacks for the same connection", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const harness = yield* makeTestWorkspaceHarness({ plugins });
+        const { executor, config } = harness;
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: server.mcpResourceUrl,
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        const original = (yield* executor.execute(
+          ToolAddress.make("tools.acme.org.main.whoami"),
+          {},
+        )) as { token: string };
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "main"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        yield* server.clearRequests;
+
+        const peer = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => peer.close().pipe(Effect.ignore));
+        const [first, second] = yield* Effect.all(
+          [
+            executor.execute(ToolAddress.make("tools.acme.org.main.whoami"), {}),
+            peer.execute(ToolAddress.make("tools.acme.org.main.whoami"), {}),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+        const firstToken = (first as { token: string }).token;
+        const secondToken = (second as { token: string }).token;
+        expect(firstToken).not.toBe(original.token);
+        expect(secondToken).toBe(firstToken);
+        const refreshGrants = (yield* server.requests).filter(
+          (request) =>
+            request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+        );
+        expect(refreshGrants).toHaveLength(1);
       }),
     ),
   );

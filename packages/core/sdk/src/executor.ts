@@ -175,6 +175,30 @@ const PLUGIN_STORAGE_DELETE_KEY_BATCH_SIZE = 90;
 const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
 const MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS = 4_000;
 
+type RefreshInFlight = Effect.Effect<string | null, StorageFailure | CredentialResolutionError>;
+
+// Scoped executors are rebuilt for each MCP session, while a self-host shares
+// its root DB handle. Keep the rotating-token gate on that shared handle so
+// separate sessions cannot redeem the same refresh token concurrently.
+//
+// SCOPE OF THE GUARANTEE: dedup reaches exactly as far as one root DB handle in
+// one process. A host that hands every scoped executor a FRESH handle (a `db`
+// factory, or a per-request handle like Cloud's) keys a different map each time
+// and gets no dedup at all — silently, because an unshared gate still behaves
+// correctly for the one caller holding it. Multi-replica deployments are outside
+// it for the same reason: a process-local map cannot see a peer replica. Both
+// need database-backed coordination (compare-and-swap on the stored refresh
+// token) rather than a wider map.
+const refreshInFlightByDb = new WeakMap<object, Map<string, RefreshInFlight>>();
+
+const refreshInFlightFor = (db: object): Map<string, RefreshInFlight> => {
+  const existing = refreshInFlightByDb.get(db);
+  if (existing) return existing;
+  const created = new Map<string, RefreshInFlight>();
+  refreshInFlightByDb.set(db, created);
+  return created;
+};
+
 // ---------------------------------------------------------------------------
 // Elicitation handler — resolved once at `createExecutor({ onElicitation })`
 // and overridable per `execute`. A tool that requests user input mid-execution
@@ -1607,6 +1631,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     });
     const rootDbUntyped = "db" in dbInput ? dbInput.db : dbInput;
     const closeDb = "db" in dbInput ? dbInput.close : undefined;
+    const refreshInFlight = refreshInFlightFor(rootDbUntyped);
     yield* Effect.try({
       try: () => {
         validateExecutorDbTables(tables, rootDbUntyped.internal.tables);
@@ -1742,17 +1767,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           ),
       });
 
-    // In-flight refresh gate — concurrent resolves of the same connection share
-    // one refresh (mirrors v1's refresh deferred-map) so we never fire two
-    // refresh-token grants for the same connection in parallel (the AS rotates
-    // the refresh token; the second request would race on a consumed token).
-    const refreshInFlight = new Map<
-      string,
-      Effect.Effect<string | null, StorageFailure | CredentialResolutionError>
-    >();
-
     const connectionKey = (row: ConnectionRow): string =>
-      `${row.owner}:${row.subject}:${row.integration}:${row.name}`;
+      `${tenant}:${row.owner}:${row.subject}:${row.integration}:${row.name}`;
 
     const loadOAuthClientRow = (
       owner: Owner,
