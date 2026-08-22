@@ -361,6 +361,72 @@ describe("connections.refresh", () => {
 });
 
 describe("tool catalog sync safety", () => {
+  it.effect("single-flights stale catalog sync across executor stacks", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let syncs = 0;
+        const sharedPlugin = definePlugin(() => ({
+          id: "shared-sync" as const,
+          remoteToolCatalog: true,
+          credentialProviders: [memoryProvider()],
+          storage: () => ({}),
+          resolveTools: () =>
+            Effect.gen(function* () {
+              syncs += 1;
+              yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 50)));
+              return {
+                tools: [{ name: ToolName.make("list"), description: "list" }],
+              };
+            }),
+          invokeTool: ({ toolRow }) => Effect.succeed({ ran: toolRow.name }),
+          extension: (ctx) => ({
+            seed: () =>
+              ctx.core.integrations.register({
+                slug: INTEG,
+                description: "Vercel",
+                config: {},
+              }),
+          }),
+        }))();
+        const config = makeTestConfig({ plugins: [sharedPlugin] as const });
+        const first = yield* createExecutor(config);
+        yield* first["shared-sync"].seed();
+        yield* first.connections.create({
+          owner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+          value: "secret-token",
+        });
+        const second = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => second.close().pipe(Effect.ignore));
+        syncs = 0;
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b.and(b("integration", "=", String(INTEG)), b("name", "=", "main")),
+            set: { tools_synced_at: null },
+          }),
+        );
+
+        yield* Effect.all([first.tools.list(), second.tools.list()], {
+          concurrency: "unbounded",
+        });
+
+        expect(syncs).toBe(1);
+
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b.and(b("integration", "=", String(INTEG)), b("name", "=", "main")),
+            set: { tools_synced_at: null },
+          }),
+        );
+        yield* first.tools.list();
+
+        expect(syncs).toBe(2);
+      }),
+    ),
+  );
+
   it.effect("active tool policies limit unfiltered stale catalog sync", () =>
     Effect.scoped(
       Effect.gen(function* () {

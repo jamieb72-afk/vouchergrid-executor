@@ -176,6 +176,7 @@ const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
 const MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS = 4_000;
 
 type RefreshInFlight = Effect.Effect<string | null, StorageFailure | CredentialResolutionError>;
+type CatalogSyncInFlight = Effect.Effect<void>;
 
 // Scoped executors are rebuilt for each MCP session, while a self-host shares
 // its root DB handle. Keep the rotating-token gate on that shared handle so
@@ -196,6 +197,16 @@ const refreshInFlightFor = (db: object): Map<string, RefreshInFlight> => {
   if (existing) return existing;
   const created = new Map<string, RefreshInFlight>();
   refreshInFlightByDb.set(db, created);
+  return created;
+};
+
+const catalogSyncInFlightByDb = new WeakMap<object, Map<string, CatalogSyncInFlight>>();
+
+const catalogSyncInFlightFor = (db: object): Map<string, CatalogSyncInFlight> => {
+  const existing = catalogSyncInFlightByDb.get(db);
+  if (existing) return existing;
+  const created = new Map<string, CatalogSyncInFlight>();
+  catalogSyncInFlightByDb.set(db, created);
   return created;
 };
 
@@ -1632,6 +1643,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const rootDbUntyped = "db" in dbInput ? dbInput.db : dbInput;
     const closeDb = "db" in dbInput ? dbInput.close : undefined;
     const refreshInFlight = refreshInFlightFor(rootDbUntyped);
+    const catalogSyncInFlight = catalogSyncInFlightFor(rootDbUntyped);
     yield* Effect.try({
       try: () => {
         validateExecutorDbTables(tables, rootDbUntyped.internal.tables);
@@ -3758,39 +3770,61 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // `produceConnectionTools` runs its clear-and-stamp cleanup path.)
           if (!runtime) continue;
 
-          const syncedAt =
-            connection.tools_synced_at == null ? null : Number(connection.tools_synced_at);
           const revisedTime =
             integrationRow.config_revised_at == null
               ? null
               : Number(integrationRow.config_revised_at);
+          const isStale = (row: ConnectionRow): boolean => {
+            const syncedAt = row.tools_synced_at == null ? null : Number(row.tools_synced_at);
+            const staleMarked = syncedAt === null;
+            const configRevised = revisedTime !== null && (syncedAt ?? 0) < revisedTime;
+            const expired =
+              cutoff !== null &&
+              runtime.plugin.remoteToolCatalog === true &&
+              syncedAt !== null &&
+              syncedAt < cutoff;
+            return staleMarked || configRevised || expired;
+          };
+          if (!isStale(connection)) continue;
 
-          const staleMarked = syncedAt === null;
-          const configRevised = revisedTime !== null && (syncedAt ?? 0) < revisedTime;
-          const expired =
-            cutoff !== null &&
-            runtime.plugin.remoteToolCatalog === true &&
-            syncedAt !== null &&
-            syncedAt < cutoff;
-          if (!staleMarked && !configRevised && !expired) continue;
-
-          yield* produceConnectionTools(
-            integrationRow,
-            {
-              owner: connection.owner as Owner,
-              integration: IntegrationSlug.make(connection.integration),
-              name: ConnectionName.make(connection.name),
-            },
-            "background",
-          ).pipe(
-            Effect.catch(() => Effect.succeed([] as readonly Tool[])),
-            Effect.withSpan("executor.tools.sync_stale", {
-              attributes: {
-                "executor.integration": connection.integration,
-                "executor.connection": connection.name,
-              },
-            }),
+          const key = connectionKey(connection);
+          const existing = catalogSyncInFlight.get(key);
+          if (existing) {
+            yield* existing;
+            continue;
+          }
+          const ref: ConnectionRef = {
+            owner: connection.owner as Owner,
+            integration: IntegrationSlug.make(connection.integration),
+            name: ConnectionName.make(connection.name),
+          };
+          // Run the refresh independently of the first client that noticed the
+          // stale row. Every scoped executor sharing this database joins the
+          // same connection-keyed fiber, so one disconnected MCP session cannot
+          // cancel the catalog production or make its peers launch duplicates.
+          // Re-read inside the gate because a caller can hold a stale query
+          // snapshot after an earlier gate settled and removed itself.
+          const running = Effect.runFork(
+            Effect.gen(function* () {
+              const latest = yield* findConnectionRow(ref);
+              if (!latest || !isStale(latest)) return;
+              yield* produceConnectionTools(integrationRow, ref, "background");
+            }).pipe(
+              Effect.catch(() => Effect.void),
+              Effect.withSpan("executor.tools.sync_stale", {
+                attributes: {
+                  "executor.integration": connection.integration,
+                  "executor.connection": connection.name,
+                },
+              }),
+              Effect.ensuring(Effect.sync(() => catalogSyncInFlight.delete(key))),
+            ),
           );
+          // No `yield*` occurs between the lookup and registration, matching
+          // the OAuth refresh gate's atomic check-and-set behavior.
+          const shared = Fiber.join(running);
+          catalogSyncInFlight.set(key, shared);
+          yield* shared;
         }
       });
 
