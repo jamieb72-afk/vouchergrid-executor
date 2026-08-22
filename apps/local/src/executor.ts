@@ -26,6 +26,7 @@ interface ResolvedStorage {
 }
 
 const localNamespace = "executor_local";
+const TOOLS_SYNC_TTL_ENV = "EXECUTOR_TOOLS_SYNC_TTL_MS";
 
 // The single local subject. Local is single-user; the executor binds one
 // tenant (the cwd-derived workspace) plus this subject so it can own both
@@ -36,6 +37,22 @@ const resolveStorage = (): ResolvedStorage => {
   const dataDir = process.env.EXECUTOR_DATA_DIR ?? join(homedir(), ".executor");
   fs.mkdirSync(dataDir, { recursive: true });
   return { dataDir };
+};
+
+export const resolveLocalToolsSyncTtlMs = (): number | null | undefined => {
+  const raw = process.env[TOOLS_SYNC_TTL_ENV];
+  if (raw === undefined || raw === "") return undefined;
+  if (raw === "off") return null;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: refuse to boot on a malformed operator knob
+    throw new Error(
+      `${TOOLS_SYNC_TTL_ENV} ${JSON.stringify(raw)} is not "off" or a positive number of milliseconds`,
+    );
+  }
+
+  return Math.floor(parsed);
 };
 
 // Hash suffix disambiguates same-basename folders so two projects with
@@ -214,6 +231,7 @@ const createLocalExecutorLayer = (options: LocalExecutorOptions = {}) => {
         subject: Subject.make(LOCAL_SUBJECT),
         db: sqlite.db,
         plugins,
+        toolsSyncTtlMs: resolveLocalToolsSyncTtlMs(),
         onIntegrationChange: (event) =>
           localAnalytics.record(
             event.kind === "added" ? "integration_added" : "integration_removed",
