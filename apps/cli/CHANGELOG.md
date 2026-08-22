@@ -1,5 +1,25 @@
 # executor
 
+## 1.5.43
+
+### Patch Changes
+
+- [`38c4934`](https://github.com/UsefulSoftwareCo/executor/commit/38c49348c7914f31e27bce1ab4efd55d9b2a756b) Thanks [@jamieb72-afk](https://github.com/jamieb72-afk)! - Single-flight background tool-catalog refreshes by connection across executor stacks sharing a database. Concurrent MCP sessions now join one provider discovery instead of launching duplicate credential prompts and OAuth browser flows.
+
+- [`f4ec3b3`](https://github.com/UsefulSoftwareCo/executor/commit/f4ec3b3f3a1dc5af04a7a24950e2fb1a6c691a45) Thanks [@jamieb72-afk](https://github.com/jamieb72-afk)! - Limit stale tool-catalog refreshes to explicit list filters and the connections visible through an active toolkit policy. Opening one toolkit MCP endpoint no longer starts every stale stdio integration, preventing unrelated OAuth browser launches and 1Password prompts during agent startup.
+
+- [`5743ced`](https://github.com/UsefulSoftwareCo/executor/commit/5743cedd16f633472a5a9b5bd302874c4af44329) Thanks [@jamieb72-afk](https://github.com/jamieb72-afk)! - Reuse one toolkit-scoped executor across local MCP client sessions and evict abandoned sessions after an idle timeout.
+
+- [`d5e9807`](https://github.com/UsefulSoftwareCo/executor/commit/d5e980741e3007978de749ff3fa2ebffa6ee68d6) Thanks [@jamieb72-afk](https://github.com/jamieb72-afk)! - Allow the local daemon to disable periodic remote tool-catalog refreshes with `EXECUTOR_TOOLS_SYNC_TTL_MS=off`. Explicit refreshes, stale notifications, and integration configuration changes continue to rebuild catalogs.
+
+- [`c6da2cb`](https://github.com/UsefulSoftwareCo/executor/commit/c6da2cbb57b5acd0180d39094912a774034b318f) Thanks [@jamieb72-afk](https://github.com/jamieb72-afk)! - Allow self-host operators to disable periodic remote tool-catalog refreshes with `EXECUTOR_TOOLS_SYNC_TTL_MS=off`. Explicit refreshes, stale notifications, and integration configuration changes continue to rebuild catalogs.
+
+- Updated dependencies [[`8124934`](https://github.com/UsefulSoftwareCo/executor/commit/8124934f6e026cf181a910d5c40c0fab6780dc85)]:
+  - @executor-js/sdk@1.5.43
+  - @executor-js/local@1.5.43
+  - @executor-js/api@1.4.63
+  - @executor-js/runtime-quickjs@1.5.43
+
 ## 1.5.42
 
 ### Patch Changes

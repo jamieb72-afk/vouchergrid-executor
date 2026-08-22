@@ -1,5 +1,27 @@
 # @executor-js/plugin-mcp
 
+## 1.5.43
+
+### Patch Changes
+
+- [#1660](https://github.com/UsefulSoftwareCo/executor/pull/1660) [`c11bef2`](https://github.com/UsefulSoftwareCo/executor/commit/c11bef2cd049db7bbf51b15e18761b14acccb534) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Cloudflare ships as MCP-only, with code mode opted out**
+
+  The Cloudflare OpenAPI preset is gone from the default catalog; the MCP preset is the one Cloudflare entry. Its endpoint now pins `?codemode=false` because Cloudflare's MCP server otherwise hides the tool catalog behind a single code-execution tool, and executor already provides the code-execution surface. Hand-entered `mcp.cloudflare.com` URLs missing the opt-out get an inline warning in the add flow telling the user to append `?codemode=false`.
+
+- [`6271c17`](https://github.com/UsefulSoftwareCo/executor/commit/6271c172725ab6bfd0ae1db5bfe97f5adb912eb5) Thanks [@xav-ie](https://github.com/xav-ie)! - **Closing a remote MCP connection now ends its streamable-http SSE request**
+
+  On a supplied `httpClientLayer`, the fetch adapter wired the caller's `AbortSignal` only to the pending response promise, never to the response body, so closing a connection left the long-lived `GET` channel in flight forever — one abandoned request per dial. Under Bun each holds one of the 256 concurrent-request slots, so a long-running process eventually exhausts the pool and every connection starts failing with `MCP discovery timed out after 15000ms`. The response stream is now interrupted when the signal aborts.
+
+- [#1654](https://github.com/UsefulSoftwareCo/executor/pull/1654) [`256e25e`](https://github.com/UsefulSoftwareCo/executor/commit/256e25e7b291b0c023bc7547d092004b66781bba) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Interrupted stdio dials no longer strand the spawned child process**
+
+  Cancelling an in-flight health check or tool discovery (a UI refresh aborting the request, or the 15s discovery timeout) abandoned the MCP connect handshake without closing the transport, leaving the spawned stdio child running indefinitely: for `docker run -i --rm` integrations, one stranded container per interrupted dial. The connect handshake now aborts on interruption (the SDK closes the transport, ending stdin and escalating to SIGTERM/SIGKILL), and tool discovery closes the connection even when the interrupt lands between the handshake completing and discovery starting.
+
+- Updated dependencies [[`2bdbedf`](https://github.com/UsefulSoftwareCo/executor/commit/2bdbedf257f54d7c209e8c856c618174c10d6bb3), [`8124934`](https://github.com/UsefulSoftwareCo/executor/commit/8124934f6e026cf181a910d5c40c0fab6780dc85)]:
+  - @executor-js/react@1.4.63
+  - @executor-js/sdk@1.5.43
+  - @executor-js/api@1.4.63
+  - @executor-js/config@1.5.43
+
 ## 1.5.42
 
 ### Patch Changes
