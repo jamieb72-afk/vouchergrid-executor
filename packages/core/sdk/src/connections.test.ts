@@ -361,6 +361,79 @@ describe("connections.refresh", () => {
 });
 
 describe("tool catalog sync safety", () => {
+  it.effect("active tool policies limit unfiltered stale catalog sync", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const github = IntegrationSlug.make("github");
+        const syncs: string[] = [];
+        const scopedPlugin = definePlugin(() => ({
+          id: "scoped-sync" as const,
+          remoteToolCatalog: true,
+          credentialProviders: [memoryProvider()],
+          storage: () => ({}),
+          resolveTools: ({ integration }) =>
+            Effect.sync(() => {
+              syncs.push(String(integration.slug));
+              return {
+                tools: [{ name: ToolName.make("list"), description: "list" }],
+              };
+            }),
+          invokeTool: ({ toolRow }) => Effect.succeed({ ran: toolRow.name }),
+          toolPolicyProvider: () => ({
+            list: () =>
+              Effect.succeed([
+                {
+                  id: "allow-vercel",
+                  pattern: "vercel.*",
+                  action: "approve" as const,
+                  position: "a0",
+                },
+              ]),
+          }),
+          extension: (ctx) => ({
+            seed: () =>
+              Effect.gen(function* () {
+                yield* ctx.core.integrations.register({
+                  slug: INTEG,
+                  description: "Vercel",
+                  config: {},
+                });
+                yield* ctx.core.integrations.register({
+                  slug: github,
+                  description: "GitHub",
+                  config: {},
+                });
+              }),
+          }),
+        }))();
+        const config = makeTestConfig({ plugins: [scopedPlugin] as const });
+        const executor = yield* createExecutor(config);
+        yield* executor["scoped-sync"].seed();
+        for (const integration of [INTEG, github]) {
+          yield* executor.connections.create({
+            owner: "org",
+            name: ConnectionName.make("main"),
+            integration,
+            template: TEMPLATE,
+            value: "secret-token",
+          });
+        }
+        syncs.length = 0;
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) =>
+              b.or(b("integration", "=", String(INTEG)), b("integration", "=", String(github))),
+            set: { tools_synced_at: null },
+          }),
+        );
+
+        yield* executor.tools.list();
+
+        expect(syncs).toEqual([String(INTEG)]);
+      }),
+    ),
+  );
+
   it.effect(
     "background sync preserves a nonzero remote catalog when a plugin returns authoritative empty",
     () =>

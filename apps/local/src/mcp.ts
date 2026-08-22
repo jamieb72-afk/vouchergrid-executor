@@ -54,6 +54,9 @@ export interface LocalMcpRequestHandlerConfig {
   readonly createConfigForResource?: (
     resource: McpResource,
   ) => Promise<LocalMcpServerConfig> | LocalMcpServerConfig;
+  /** Dispose abandoned Streamable HTTP sessions after this idle window.
+   * Set to zero to disable idle eviction. */
+  readonly sessionIdleTtlMs?: number;
 }
 
 // Local serves these error bodies in-process; like the self-host store they are
@@ -128,9 +131,11 @@ export const createMcpRequestHandler = (
   const servers = new Map<string, McpServer>();
   const resources = new Map<string, McpResource>();
   const sessionEngines = new Map<string, AnyExecutionEngine>();
-  const sessionClosers = new Map<string, () => Promise<void>>();
+  const sessionLastActive = new Map<string, number>();
+  const resourceConfigs = new Map<string, Promise<LocalMcpServerConfig>>();
   const approvals = makeInProcessBrowserApprovalStore();
   const defaultEngine = engineFromConfig(handlerConfig.defaultConfig);
+  const sessionIdleTtlMs = handlerConfig.sessionIdleTtlMs ?? 5 * 60 * 1_000;
 
   const pausedDetail = (
     sessionId: string,
@@ -147,22 +152,64 @@ export const createMcpRequestHandler = (
 
   const configForResource = async (resource: McpResource): Promise<LocalMcpServerConfig> => {
     if (!handlerConfig.createConfigForResource) return { config: handlerConfig.defaultConfig };
-    return handlerConfig.createConfigForResource(resource);
+    const key = mcpResourceKey(resource);
+    const cached = resourceConfigs.get(key);
+    if (cached) return cached;
+
+    const pending = Promise.resolve(handlerConfig.createConfigForResource(resource));
+    resourceConfigs.set(key, pending);
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: evict a rejected factory promise before preserving its original rejection
+    try {
+      return await pending;
+    } catch (error) {
+      if (resourceConfigs.get(key) === pending) resourceConfigs.delete(key);
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: the request handler maps this factory rejection to a protocol response
+      throw error;
+    }
+  };
+
+  const closeResourceConfigs = async (): Promise<void> => {
+    const pending = [...resourceConfigs.values()];
+    resourceConfigs.clear();
+    const configs = await Promise.all(
+      pending.map((config) =>
+        config.then(
+          (value) => value,
+          () => null,
+        ),
+      ),
+    );
+    await Promise.all(configs.map((config) => ignoreClose(config?.close)));
   };
 
   const dispose = async (id: string, opts: { transport?: boolean; server?: boolean } = {}) => {
     const t = transports.get(id);
     const s = servers.get(id);
-    const close = sessionClosers.get(id);
     transports.delete(id);
     servers.delete(id);
     resources.delete(id);
     sessionEngines.delete(id);
-    sessionClosers.delete(id);
+    sessionLastActive.delete(id);
     if (opts.transport) await ignoreClose(t ? () => t.close() : undefined);
     if (opts.server) await ignoreClose(s ? () => s.close() : undefined);
-    await ignoreClose(close);
   };
+
+  const sweepIdleSessions = async (): Promise<void> => {
+    if (sessionIdleTtlMs <= 0) return;
+    const cutoff = Date.now() - sessionIdleTtlMs;
+    const expired = [...sessionLastActive.entries()]
+      .filter(([, lastActive]) => lastActive <= cutoff)
+      .map(([sessionId]) => sessionId);
+    await Promise.all(
+      expired.map((sessionId) => dispose(sessionId, { transport: true, server: true })),
+    );
+  };
+
+  const sweepTimer =
+    sessionIdleTtlMs > 0
+      ? setInterval(() => void sweepIdleSessions(), Math.min(sessionIdleTtlMs, 30_000))
+      : null;
+  sweepTimer?.unref?.();
 
   return {
     handleRequest: async (request) => {
@@ -177,6 +224,7 @@ export const createMcpRequestHandler = (
         if (!sessionResource || mcpResourceKey(sessionResource) !== mcpResourceKey(resource)) {
           return jsonError(403, -32003, "Session belongs to a different MCP resource");
         }
+        sessionLastActive.set(sessionId, Date.now());
         return transport.handleRequest(request);
       }
 
@@ -199,9 +247,9 @@ export const createMcpRequestHandler = (
           transports.set(sid, transport);
           if (created) servers.set(sid, created);
           resources.set(sid, resource);
+          sessionLastActive.set(sid, Date.now());
           const engine = resourceConfig ? engineFromConfig(resourceConfig.config) : null;
           if (engine) sessionEngines.set(sid, engine);
-          if (resourceConfig?.close) sessionClosers.set(sid, resourceConfig.close);
         },
         onsessionclosed: (sid) => void dispose(sid, { server: true }),
       });
@@ -237,7 +285,6 @@ export const createMcpRequestHandler = (
           await ignoreClose(() => transport.close());
           const server = created;
           await ignoreClose(server ? () => server.close() : undefined);
-          await ignoreClose(resourceConfig?.close);
         }
         return response;
       } catch (error) {
@@ -246,7 +293,6 @@ export const createMcpRequestHandler = (
           await ignoreClose(() => transport.close());
           const server = created;
           await ignoreClose(server ? () => server.close() : undefined);
-          await ignoreClose(resourceConfig?.close);
         }
         return jsonError(500, -32603, "Internal server error");
       }
@@ -282,8 +328,10 @@ export const createMcpRequestHandler = (
     },
 
     close: async () => {
+      if (sweepTimer) clearInterval(sweepTimer);
       const ids = new Set([...transports.keys(), ...servers.keys()]);
       await Promise.all([...ids].map((id) => dispose(id, { transport: true, server: true })));
+      await closeResourceConfigs();
     },
   };
 };
