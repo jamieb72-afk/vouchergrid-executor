@@ -3661,97 +3661,142 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     //    is older than the freshness TTL.
     // Best-effort: a failed rebuild leaves the stale-but-working catalog in
     // place and retries on the next read.
-    const syncStaleConnectionTools = Effect.gen(function* () {
-      // The platform view can never persist a rebuilt catalog (writes are
-      // denied at the storage boundary), so attempting the sync would only
-      // fire upstream `resolveTools` calls whose results are thrown away —
-      // network side effects on a read-only credential. Skip it entirely:
-      // read-only-ness of the platform read path is a stated invariant here,
-      // not an accident of the best-effort catch below.
-      if (config.platformView === true) return;
-      const integrations = yield* core.findMany("integration", {});
-      if (integrations.length === 0) return;
-      const integrationBySlug = new Map(integrations.map((row) => [row.slug, row] as const));
-      // The TTL only matters when a loaded plugin actually lists a live remote
-      // catalog; otherwise skip it so age alone never widens the stale query.
-      const anyRemoteCatalog = Array.from(runtimes.values()).some(
-        (runtime) => runtime.plugin.remoteToolCatalog === true,
-      );
-      const cutoff =
-        toolsSyncTtlMs == null || !anyRemoteCatalog ? null : Date.now() - toolsSyncTtlMs;
-
-      // Bound the scan to potentially-stale rows: stale-marked (NULL stamp) or
-      // synced before the latest instant any trigger could fire at (the TTL
-      // cutoff / the newest config revision). Per-row trigger checks below
-      // re-verify against each row's own integration; in steady state this
-      // query returns nothing and the read pays one indexed lookup.
-      const latestRevision = integrations.reduce<number | null>(
-        (max, row) =>
-          row.config_revised_at == null
-            ? max
-            : Math.max(max ?? Number(row.config_revised_at), Number(row.config_revised_at)),
-        null,
-      );
-      const staleBefore =
-        cutoff === null && latestRevision === null
-          ? null
-          : Math.max(cutoff ?? Number.MIN_SAFE_INTEGER, latestRevision ?? Number.MIN_SAFE_INTEGER);
-
-      const connections = yield* core.findMany("connection", {
-        where: (b: AnyCb) =>
-          staleBefore === null
-            ? b.isNull("tools_synced_at")
-            : b.or(b.isNull("tools_synced_at"), b("tools_synced_at", "<", staleBefore)),
-      });
-      for (const connection of connections) {
-        const integrationRow = integrationBySlug.get(connection.integration);
-        if (!integrationRow) continue;
-        const runtime = runtimes.get(integrationRow.plugin_id);
-        // Only re-produce catalogs this executor can actually re-list —
-        // rebuilding under an unloaded plugin would clear a working catalog.
-        // (A loaded plugin without `resolveTools` still flows through:
-        // `produceConnectionTools` runs its clear-and-stamp cleanup path.)
-        if (!runtime) continue;
-
-        const syncedAt =
-          connection.tools_synced_at == null ? null : Number(connection.tools_synced_at);
-        const revisedTime =
-          integrationRow.config_revised_at == null
-            ? null
-            : Number(integrationRow.config_revised_at);
-
-        const staleMarked = syncedAt === null;
-        const configRevised = revisedTime !== null && (syncedAt ?? 0) < revisedTime;
-        const expired =
-          cutoff !== null &&
-          runtime.plugin.remoteToolCatalog === true &&
-          syncedAt !== null &&
-          syncedAt < cutoff;
-        if (!staleMarked && !configRevised && !expired) continue;
-
-        yield* produceConnectionTools(
-          integrationRow,
-          {
-            owner: connection.owner as Owner,
-            integration: IntegrationSlug.make(connection.integration),
-            name: ConnectionName.make(connection.name),
-          },
-          "background",
-        ).pipe(
-          Effect.catch(() => Effect.succeed([] as readonly Tool[])),
-          Effect.withSpan("executor.tools.sync_stale", {
-            attributes: {
-              "executor.integration": connection.integration,
-              "executor.connection": connection.name,
-            },
-          }),
+    const syncStaleConnectionTools = (filter?: ToolListFilter) =>
+      Effect.gen(function* () {
+        // The platform view can never persist a rebuilt catalog (writes are
+        // denied at the storage boundary), so attempting the sync would only
+        // fire upstream `resolveTools` calls whose results are thrown away —
+        // network side effects on a read-only credential. Skip it entirely:
+        // read-only-ness of the platform read path is a stated invariant here,
+        // not an accident of the best-effort catch below.
+        if (config.platformView === true) return;
+        const integrations = yield* core.findMany("integration", {});
+        if (integrations.length === 0) return;
+        const integrationBySlug = new Map(integrations.map((row) => [row.slug, row] as const));
+        // The TTL only matters when a loaded plugin actually lists a live remote
+        // catalog; otherwise skip it so age alone never widens the stale query.
+        const anyRemoteCatalog = Array.from(runtimes.values()).some(
+          (runtime) => runtime.plugin.remoteToolCatalog === true,
         );
-      }
-    });
+        const cutoff =
+          toolsSyncTtlMs == null || !anyRemoteCatalog ? null : Date.now() - toolsSyncTtlMs;
+
+        // Bound the scan to potentially-stale rows: stale-marked (NULL stamp) or
+        // synced before the latest instant any trigger could fire at (the TTL
+        // cutoff / the newest config revision). Per-row trigger checks below
+        // re-verify against each row's own integration; in steady state this
+        // query returns nothing and the read pays one indexed lookup.
+        const latestRevision = integrations.reduce<number | null>(
+          (max, row) =>
+            row.config_revised_at == null
+              ? max
+              : Math.max(max ?? Number(row.config_revised_at), Number(row.config_revised_at)),
+          null,
+        );
+        const staleBefore =
+          cutoff === null && latestRevision === null
+            ? null
+            : Math.max(
+                cutoff ?? Number.MIN_SAFE_INTEGER,
+                latestRevision ?? Number.MIN_SAFE_INTEGER,
+              );
+
+        // Toolkit-scoped executors install an active allowlist policy but still
+        // issue unfiltered list calls while building their live connection
+        // inventory. Resolve that policy against the persisted catalog before
+        // refreshing anything, otherwise opening one toolkit dials every stale
+        // stdio integration in the workspace.
+        const policyVisibleConnectionKeys = activeToolPolicyProvider
+          ? yield* Effect.gen(function* () {
+              const rows = yield* core.findMany("tool", {
+                select: TOOL_INVOCATION_COLUMNS,
+              });
+              const policyRules = yield* listActivePolicyRuleSet();
+              const keys = new Set<string>();
+              for (const row of rows) {
+                const tool = rowToTool(row);
+                const effective = yield* resolvePolicyFromRuleSet(
+                  normalizedPolicyId(tool),
+                  policyRules,
+                  tool.annotations?.requiresApproval,
+                );
+                if (effective.action === "block") continue;
+                keys.add(`${tool.owner}:${tool.integration}:${tool.connection}`);
+              }
+              return keys;
+            })
+          : null;
+
+        const connections = yield* core.findMany("connection", {
+          where: (b: AnyCb) =>
+            b.and(
+              filter?.integration === undefined
+                ? true
+                : b("integration", "=", String(filter.integration)),
+              filter?.owner === undefined ? true : b("owner", "=", filter.owner),
+              filter?.connection === undefined ? true : b("name", "=", String(filter.connection)),
+              staleBefore === null
+                ? b.isNull("tools_synced_at")
+                : b.or(b.isNull("tools_synced_at"), b("tools_synced_at", "<", staleBefore)),
+            ),
+        });
+        for (const connection of connections) {
+          if (
+            policyVisibleConnectionKeys !== null &&
+            !policyVisibleConnectionKeys.has(
+              `${connection.owner}:${connection.integration}:${connection.name}`,
+            )
+          ) {
+            continue;
+          }
+          const integrationRow = integrationBySlug.get(connection.integration);
+          if (!integrationRow) continue;
+          const runtime = runtimes.get(integrationRow.plugin_id);
+          // Only re-produce catalogs this executor can actually re-list —
+          // rebuilding under an unloaded plugin would clear a working catalog.
+          // (A loaded plugin without `resolveTools` still flows through:
+          // `produceConnectionTools` runs its clear-and-stamp cleanup path.)
+          if (!runtime) continue;
+
+          const syncedAt =
+            connection.tools_synced_at == null ? null : Number(connection.tools_synced_at);
+          const revisedTime =
+            integrationRow.config_revised_at == null
+              ? null
+              : Number(integrationRow.config_revised_at);
+
+          const staleMarked = syncedAt === null;
+          const configRevised = revisedTime !== null && (syncedAt ?? 0) < revisedTime;
+          const expired =
+            cutoff !== null &&
+            runtime.plugin.remoteToolCatalog === true &&
+            syncedAt !== null &&
+            syncedAt < cutoff;
+          if (!staleMarked && !configRevised && !expired) continue;
+
+          yield* produceConnectionTools(
+            integrationRow,
+            {
+              owner: connection.owner as Owner,
+              integration: IntegrationSlug.make(connection.integration),
+              name: ConnectionName.make(connection.name),
+            },
+            "background",
+          ).pipe(
+            Effect.catch(() => Effect.succeed([] as readonly Tool[])),
+            Effect.withSpan("executor.tools.sync_stale", {
+              attributes: {
+                "executor.integration": connection.integration,
+                "executor.connection": connection.name,
+              },
+            }),
+          );
+        }
+      });
 
     const toolsList = (filter?: ToolListFilter): Effect.Effect<readonly Tool[], StorageFailure> =>
       Effect.gen(function* () {
-        yield* syncStaleConnectionTools;
+        yield* syncStaleConnectionTools(filter);
         // Projected: the list surface is metadata (address, description,
         // annotations) — loading every tool's input/output schema JSON made
         // an unbounded list scale with schema bytes, not tool count.
