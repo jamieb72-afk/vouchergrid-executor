@@ -52,6 +52,8 @@ export interface SelfHostConfig {
    */
   readonly sandboxTimeoutMs: number | undefined;
   readonly mcpSessionIdleTtlMs: number | undefined;
+  /** Undefined uses the SDK default; null disables time-based catalog refresh. */
+  readonly toolsSyncTtlMs: number | null | undefined;
 }
 
 export const resolveDataDir = (): string =>
@@ -159,6 +161,7 @@ export const loadConfig = (): SelfHostConfig => {
     orgSlug: resolveOrgSlug(),
     sandboxTimeoutMs: resolveSandboxTimeoutMs(),
     mcpSessionIdleTtlMs: resolveMcpSessionIdleTtlMs(),
+    toolsSyncTtlMs: resolveToolsSyncTtlMs(),
   };
 };
 
@@ -190,6 +193,20 @@ const resolveMcpSessionIdleTtlMs = (): number | undefined => {
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: refuse to boot on a malformed operator knob
     throw new Error(
       `EXECUTOR_MCP_SESSION_IDLE_TTL_MS ${JSON.stringify(raw)} is not a non-negative number of milliseconds`,
+    );
+  }
+  return Math.floor(parsed);
+};
+
+const resolveToolsSyncTtlMs = (): number | null | undefined => {
+  const raw = process.env.EXECUTOR_TOOLS_SYNC_TTL_MS;
+  if (!raw) return undefined;
+  if (raw === "off") return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: refuse to boot on a malformed operator knob
+    throw new Error(
+      `EXECUTOR_TOOLS_SYNC_TTL_MS ${JSON.stringify(raw)} is not "off" or a positive number of milliseconds`,
     );
   }
   return Math.floor(parsed);

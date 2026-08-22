@@ -92,6 +92,8 @@ export interface HostConfigShape {
    * detail of credential storage.
    */
   readonly exposeCredentialProviders?: boolean;
+  /** Forwarded to the SDK's remote tool-catalog freshness control. */
+  readonly toolsSyncTtlMs?: ExecutorConfig["toolsSyncTtlMs"];
   /**
    * Forwarded to `ExecutorConfig.onIntegrationChange`: best-effort post-commit
    * observation of durable integration-catalog changes (see the sdk contract).
@@ -291,6 +293,7 @@ export const makeScopedExecutor = <
       redirectUri,
       oauthCallbackStateOrgSlug: orgSlug,
       firstPartyOAuthClients: config.firstPartyOAuthClients,
+      toolsSyncTtlMs: config.toolsSyncTtlMs,
       coreTools: {
         webBaseUrl,
         orgSlug,
